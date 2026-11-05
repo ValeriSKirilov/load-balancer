@@ -90,6 +90,8 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
          }},
         {"WEIGHTED_RR",
          [](const std::vector<BackendServer>& servers) {
+           if (wrr_schedule.empty()) return -1;
+
            for (size_t i = 0; i < wrr_schedule.size(); ++i) {
              int idx = wrr_index.fetch_add(1, std::memory_order_relaxed) %
                        wrr_schedule.size();
@@ -103,10 +105,40 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
          }},
         {"LEAST_CONN",
          [](const std::vector<BackendServer>& servers) {
-           return 0; /* Implement LEAST_CONN logic */
+           int min_connections = INT_MAX;
+           int best_idx = -1;
+           for (size_t i = 0; i < servers.size(); ++i) {
+             if (!servers[i].is_healthy.load(std::memory_order_relaxed))
+               continue;
+
+             int curr_conn =
+                 servers[i].active_connections.load(std::memory_order_relaxed);
+             if (curr_conn < min_connections) {
+               min_connections = curr_conn;
+               best_idx = static_cast<int>(i);
+             }
+           }
+           return best_idx;
          }},
         {"LEAST_TIME", [](const std::vector<BackendServer>& servers) {
-           return 0; /* Implement LEAST_TIME logic */
+           int best_idx = -1;
+           long long min_score = LLONG_MIN;
+
+           for (size_t i = 0; i < servers.size(); ++i) {
+             if (!servers[i].is_healthy.load(std::memory_order_relaxed))
+               continue;
+
+             long long curr_latency =
+                 servers[i].avg_latency_time.load(std::memory_order_relaxed);
+             int curr_conn =
+                 servers[i].active_connections.load(std::memory_order_relaxed);
+             long long score = curr_latency * (curr_conn + 1);
+             if (score < min_score) {
+               min_score = score;
+               best_idx = static_cast<int>(i);
+             }
+           }
+           return best_idx;
          }}};
 
 std::vector<BackendServer> load_backend_servers(
@@ -235,8 +267,7 @@ std::vector<int> generate_wrr_schedule(
 
 int main(const int argc, const char* argv[]) {
   if (argc > 1 &&
-      (reinterpret_cast<const char*>(argv[1]) == std::string("-help") ||
-       reinterpret_cast<const char*>(argv[1]) == std::string("-h"))) {
+      (argv[1] == std::string("-help") || argv[1] == std::string("-h"))) {
     std::cerr << usage;
     return 1;
   }

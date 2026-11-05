@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -35,7 +36,10 @@ const std::string INVALID_CONFIG_FILE_ERROR =
     "backend servers found.\n"
     "Expected format per line: <IP_ADDRESS> <PORT> <WEIGHT>\n";
 
-static std::atomic<int> rr_index{0};
+static std::atomic<unsigned int> rr_index{0};
+static std::atomic<unsigned int> wrr_index{0};
+
+static std::vector<int> wrr_schedule;
 
 struct BackendServer {
   std::string ip;
@@ -61,28 +65,49 @@ struct BackendServer {
         port(other.port),
         weight(other.weight),
         addr(other.addr),
-        active_connections(other.active_connections.load()),
-        is_healthy(other.is_healthy.load()),
-        avg_latency_time(other.avg_latency_time.load()),
-        last_response_time(other.last_response_time.load()) {}
+        active_connections(
+            other.active_connections.load(std::memory_order_relaxed)),
+        is_healthy(other.is_healthy.load(std::memory_order_relaxed)),
+        avg_latency_time(
+            other.avg_latency_time.load(std::memory_order_relaxed)),
+        last_response_time(
+            other.last_response_time.load(std::memory_order_relaxed)) {}
 };
 
 std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
-    algorithm_map = {{"ROUND_ROBIN",
-                      [](const std::vector<BackendServer>&) {
-                        return 0; /* Implement ROUND_ROBIN logic */
-                      }},
-                     {"WEIGHTED_RR",
-                      [](const std::vector<BackendServer>&) {
-                        return 0; /* Implement WEIGHTED_RR logic */
-                      }},
-                     {"LEAST_CONN",
-                      [](const std::vector<BackendServer>&) {
-                        return 0; /* Implement LEAST_CONN logic */
-                      }},
-                     {"LEAST_TIME", [](const std::vector<BackendServer>&) {
-                        return 0; /* Implement LEAST_TIME logic */
-                      }}};
+    algorithm_map = {
+        {"ROUND_ROBIN",
+         [](const std::vector<BackendServer>& servers) {
+           size_t num_servers = servers.size();
+           for (size_t i = 0; i < num_servers; ++i) {
+             int idx =
+                 rr_index.fetch_add(1, std::memory_order_relaxed) % num_servers;
+             if (servers[idx].is_healthy.load(std::memory_order_relaxed)) {
+               return idx;
+             }
+           }
+           return -1;
+         }},
+        {"WEIGHTED_RR",
+         [](const std::vector<BackendServer>& servers) {
+           for (size_t i = 0; i < wrr_schedule.size(); ++i) {
+             int idx = wrr_index.fetch_add(1, std::memory_order_relaxed) %
+                       wrr_schedule.size();
+             if (servers[wrr_schedule[idx]].is_healthy.load(
+                     std::memory_order_relaxed)) {
+               return wrr_schedule[idx];
+             }
+           }
+
+           return -1;
+         }},
+        {"LEAST_CONN",
+         [](const std::vector<BackendServer>& servers) {
+           return 0; /* Implement LEAST_CONN logic */
+         }},
+        {"LEAST_TIME", [](const std::vector<BackendServer>& servers) {
+           return 0; /* Implement LEAST_TIME logic */
+         }}};
 
 std::vector<BackendServer> load_backend_servers(
     const std::string& config_path) {
@@ -168,6 +193,46 @@ bool health_check(BackendServer& server) {
   return true;
 }
 
+std::vector<int> generate_wrr_schedule(
+    const std::vector<BackendServer>& servers) {
+  size_t total_weight = 0;
+
+  struct ActiveServer {
+    size_t original_index;
+    int weight;
+  };
+  std::vector<ActiveServer> active_servers;
+
+  for (size_t i = 0; i < servers.size(); ++i) {
+    if (servers[i].is_healthy.load(std::memory_order_relaxed)) {
+      total_weight += servers[i].weight;
+      active_servers.push_back({i, servers[i].weight});
+    }
+  }
+
+  if (total_weight == 0) {
+    return {};
+  }
+
+  std::vector<int> schedule;
+  std::vector<int> current_weight(active_servers.size(), 0);
+
+  for (size_t i = 0; i < total_weight; ++i) {
+    int curr_max = INT_MIN, max_weight_index = 0;
+    for (size_t j = 0; j < active_servers.size(); ++j) {
+      current_weight[j] += active_servers[j].weight;
+      if (current_weight[j] > curr_max) {
+        curr_max = current_weight[j];
+        max_weight_index = j;
+      }
+    }
+    schedule.push_back(active_servers[max_weight_index].original_index);
+    current_weight[max_weight_index] -= total_weight;
+  }
+
+  return schedule;
+}
+
 int main(const int argc, const char* argv[]) {
   if (argc > 1 &&
       (reinterpret_cast<const char*>(argv[1]) == std::string("-help") ||
@@ -221,6 +286,8 @@ int main(const int argc, const char* argv[]) {
   if (servers.empty()) {
     return 1;
   }
+
+  wrr_schedule = generate_wrr_schedule(servers);
 
   return 0;
 }

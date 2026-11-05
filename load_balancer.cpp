@@ -1,8 +1,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -109,8 +111,8 @@ std::vector<BackendServer> load_backend_servers(
     }
 
     if (port >= 1 && port <= 65535 && weight >= 1) {
-      sockaddr_in dummy_adr;
-      if (inet_pton(AF_INET, ip.c_str(), &dummy_adr) == 1) {
+      in_addr dummy_addr{};
+      if (inet_pton(AF_INET, ip.c_str(), &dummy_addr) == 1) {
         servers.emplace_back(ip, port, weight);
       }
     }
@@ -126,8 +128,44 @@ std::vector<BackendServer> load_backend_servers(
   return servers;
 }
 
+long long current_time_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 bool health_check(BackendServer& server) {
-  
+  int sockFd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockFd < 0) {
+    std::cerr << "[ERROR] Failed to create socket for health check.\n";
+    return false;
+  }
+
+  timeval timeout{};
+  timeout.tv_sec = 2;
+  timeout.tv_usec = 0;
+  setsockopt(sockFd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  long long start_ms = current_time_ms();
+
+  if (connect(sockFd, reinterpret_cast<sockaddr*>(&server.addr),
+              sizeof(server.addr)) < 0) {
+    std::cerr << "[ERROR] Health check failed for server: " << server.ip << ":"
+              << server.port << '\n';
+    close(sockFd);
+    server.is_healthy = false;
+    return false;
+  }
+
+  long long end_ms = current_time_ms();
+  close(sockFd);
+
+  server.is_healthy = true;
+  server.last_response_time = end_ms;
+  server.avg_latency_time = std::max(1LL, end_ms - start_ms);
+
+  return true;
 }
 
 int main(const int argc, const char* argv[]) {
@@ -177,11 +215,6 @@ int main(const int argc, const char* argv[]) {
 
   if (argc >= 4) {
     configFile = argv[3];
-  }
-
-  if (!std::ifstream(configFile).good()) {
-    fprintf(stderr, INVALID_CONFIG_FILE_ERROR.c_str(), configFile.c_str());
-    return 1;
   }
 
   std::vector<BackendServer> servers = load_backend_servers(configFile);

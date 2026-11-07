@@ -1,18 +1,29 @@
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
+#include <csignal>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#define MAX_EVENTS 128
 
 const std::string usage =
     "Usage: ./load_balancer <algorithm> <num_threads>\n"
@@ -41,11 +52,16 @@ static std::atomic<unsigned int> wrr_index{0};
 
 static std::vector<int> wrr_schedule;
 
+static std::atomic<bool> server_running{true};
+
+static std::vector<std::thread> worker_threads;
+
 struct BackendServer {
   std::string ip;
   int port;
   int weight;
-  sockaddr_in addr{};
+  struct sockaddr_storage addr {};
+  socklen_t addr_len{0};
 
   std::atomic<int> active_connections{0};
   std::atomic<bool> is_healthy{true};
@@ -55,9 +71,20 @@ struct BackendServer {
   BackendServer(const std::string& server_ip, int server_port,
                 int server_weight)
       : ip(server_ip), port(server_port), weight(server_weight) {
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip.c_str(), &addr.sin_addr);
+    struct addrinfo hints, *res;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(server_ip.c_str(), std::to_string(server_port).c_str(),
+                    &hints, &res) != 0) {
+      std::cerr << "[ERROR] Failed to get address information for server: "
+                << server_ip << ":" << server_port << '\n';
+      return;
+    }
+    std::memcpy(&addr, res->ai_addr, res->ai_addrlen);
+    addr_len = res->ai_addrlen;
+    freeaddrinfo(res);
   }
 
   BackendServer(BackendServer&& other) noexcept
@@ -65,6 +92,7 @@ struct BackendServer {
         port(other.port),
         weight(other.weight),
         addr(other.addr),
+        addr_len(other.addr_len),
         active_connections(
             other.active_connections.load(std::memory_order_relaxed)),
         is_healthy(other.is_healthy.load(std::memory_order_relaxed)),
@@ -72,6 +100,73 @@ struct BackendServer {
             other.avg_latency_time.load(std::memory_order_relaxed)),
         last_response_time(
             other.last_response_time.load(std::memory_order_relaxed)) {}
+};
+
+class ThreadPool {
+ private:
+  std::vector<std::thread> threads;
+  std::queue<std::function<void()>> tasks;
+  std::mutex queue_mutex;
+  std::condition_variable cv;
+
+  bool stop{false};
+
+ public:
+  explicit ThreadPool(size_t num_threads) {
+    for (size_t i = 0; i < num_threads; ++i) {
+      threads.emplace_back([this] {
+        while (true) {
+          std::function<void()> task;
+          {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            cv.wait(lock, [this] { return stop || !tasks.empty(); });
+
+            if (stop && tasks.empty()) {
+              return;
+            }
+
+            task = std::move(tasks.front());
+            tasks.pop();
+          }
+          try {
+            task();
+          } catch (const std::exception& e) {
+            std::cerr << "[ThreadPool] Task threw exception: " << e.what()
+                      << "\n";
+          } catch (...) {
+            std::cerr << "[ThreadPool] Task threw an unknown exception.\n";
+          }
+        }
+      });
+    }
+  }
+
+  ~ThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      stop = true;
+    }
+    cv.notify_all();
+    for (auto& t : threads) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
+  }
+
+  ThreadPool(const ThreadPool&) = delete;
+  ThreadPool& operator=(const ThreadPool&) = delete;
+
+  void enqueue(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      if (stop) {
+        return;
+      }
+      tasks.push(std::move(task));
+    }
+    cv.notify_one();
+  }
 };
 
 std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
@@ -122,7 +217,7 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
          }},
         {"LEAST_TIME", [](const std::vector<BackendServer>& servers) {
            int best_idx = -1;
-           long long min_score = LLONG_MIN;
+           long long min_score = LLONG_MAX;
 
            for (size_t i = 0; i < servers.size(); ++i) {
              if (!servers[i].is_healthy.load(std::memory_order_relaxed))
@@ -168,10 +263,13 @@ std::vector<BackendServer> load_backend_servers(
     }
 
     if (port >= 1 && port <= 65535 && weight >= 1) {
-      in_addr dummy_addr{};
-      if (inet_pton(AF_INET, ip.c_str(), &dummy_addr) == 1) {
-        servers.emplace_back(ip, port, weight);
+      BackendServer server(ip, port, weight);
+      if (server.addr_len == 0) {
+        std::cerr << "[WARNING] Skipping server with invalid address: " << ip
+                  << ":" << port << '\n';
+        continue;
       }
+      servers.emplace_back(std::move(server));
     }
   }
 
@@ -192,7 +290,7 @@ long long current_time_ms() {
 }
 
 bool health_check(BackendServer& server) {
-  int sockFd = socket(AF_INET, SOCK_STREAM, 0);
+  int sockFd = socket(server.addr.ss_family, SOCK_STREAM, 0);
   if (sockFd < 0) {
     std::cerr << "[ERROR] Failed to create socket for health check.\n";
     return false;
@@ -206,8 +304,8 @@ bool health_check(BackendServer& server) {
 
   long long start_ms = current_time_ms();
 
-  if (connect(sockFd, reinterpret_cast<sockaddr*>(&server.addr),
-              sizeof(server.addr)) < 0) {
+  if (connect(sockFd, reinterpret_cast<struct sockaddr*>(&server.addr),
+              server.addr_len) < 0) {
     std::cerr << "[ERROR] Health check failed for server: " << server.ip << ":"
               << server.port << '\n';
     close(sockFd);
@@ -265,6 +363,28 @@ std::vector<int> generate_wrr_schedule(
   return schedule;
 }
 
+void handle_signal(int signal) {
+  if (signal == SIGINT || signal == SIGTERM) {
+    std::cerr << "\n[INFO] Signal received. Shutting down gracefully...\n";
+    server_running = false;
+  }
+}
+
+bool set_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL);
+  if (flags == -1) {
+    std::cerr << "[ERROR] Failed to get file descriptor flags.\n";
+    return false;
+  }
+
+  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+    std::cerr << "[ERROR] Failed to set file descriptor to non-blocking.\n";
+    return false;
+  }
+
+  return true;
+}
+
 int main(const int argc, const char* argv[]) {
   if (argc > 1 &&
       (argv[1] == std::string("-help") || argv[1] == std::string("-h"))) {
@@ -319,6 +439,65 @@ int main(const int argc, const char* argv[]) {
   }
 
   wrr_schedule = generate_wrr_schedule(servers);
+
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
+
+  ThreadPool pool(num_threads);
+
+  struct addrinfo hints, *res;
+  int listen_fd;
+
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_flags = AI_PASSIVE;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (getaddrinfo(nullptr, "8080", &hints, &res) != 0) {
+    std::cerr << "[ERROR] Failed to get address information.\n";
+    return 1;
+  }
+
+  listen_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (listen_fd == -1) {
+    std::cerr << "[ERROR] Failed to create listening socket.\n";
+    freeaddrinfo(res);
+    return 1;
+  }
+
+  int yes = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  if (bind(listen_fd, res->ai_addr, res->ai_addrlen) == -1) {
+    std::cerr << "[ERROR] Failed to bind listening socket.\n";
+    freeaddrinfo(res);
+    return 1;
+  }
+
+  freeaddrinfo(res);
+
+  set_nonblocking(listen_fd);
+  listen(listen_fd, SOMAXCONN);
+
+  int epoll_fd = epoll_create1(0);
+  if (epoll_fd == -1) {
+    std::cerr << "[ERROR] Failed to create epoll instance.\n";
+    return 1;
+  }
+
+  struct epoll_event ev {};
+  ev.events = EPOLLIN | EPOLLET;
+  ev.data.fd = listen_fd;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev) == -1) {
+    std::cerr << "[ERROR] Failed to add listening socket to epoll.\n";
+    return 1;
+  }
+
+  struct epoll_event events[MAX_EVENTS];
+
+  while (server_running) {
+  }
 
   return 0;
 }

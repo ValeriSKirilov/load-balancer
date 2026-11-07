@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -167,6 +168,11 @@ class ThreadPool {
     }
     cv.notify_one();
   }
+};
+
+struct ClientContext {
+  int client_fd;
+  std::string request_buffer;
 };
 
 std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
@@ -450,54 +456,135 @@ int main(const int argc, const char* argv[]) {
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
-  hints.ai_flags = AI_PASSIVE;
   hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
 
   if (getaddrinfo(nullptr, "8080", &hints, &res) != 0) {
     std::cerr << "[ERROR] Failed to get address information.\n";
     return 1;
   }
 
-  listen_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (listen_fd == -1) {
-    std::cerr << "[ERROR] Failed to create listening socket.\n";
-    freeaddrinfo(res);
-    return 1;
-  }
+  struct addrinfo* p;
+  for (p = res; p != nullptr; p = p->ai_next) {
+    listen_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (listen_fd == -1) {
+      continue;
+    }
 
-  int yes = 1;
-  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    int yes = 1;
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) ==
+        -1) {
+      std::cerr << "[ERROR] Failed to set socket option.\n";
+      close(listen_fd);
+      continue;
+    }
 
-  if (bind(listen_fd, res->ai_addr, res->ai_addrlen) == -1) {
-    std::cerr << "[ERROR] Failed to bind listening socket.\n";
-    freeaddrinfo(res);
-    return 1;
+    if (bind(listen_fd, p->ai_addr, p->ai_addrlen) == 0) {
+      break;  // Successfully bound
+    }
+
+    close(listen_fd);
   }
 
   freeaddrinfo(res);
+  if (p == nullptr) {
+    std::cerr << "[ERROR] Failed to bind to any address.\n";
+    return 1;
+  }
 
-  set_nonblocking(listen_fd);
-  listen(listen_fd, SOMAXCONN);
+  if (set_nonblocking(listen_fd) == false) {
+    std::cerr << "[ERROR] Failed to set listening socket to non-blocking.\n";
+    close(listen_fd);
+    return 1;
+  }
+
+  if (listen(listen_fd, SOMAXCONN) == -1) {
+    std::cerr << "[ERROR] Failed to listen on socket.\n";
+    close(listen_fd);
+    return 1;
+  }
 
   int epoll_fd = epoll_create1(0);
   if (epoll_fd == -1) {
     std::cerr << "[ERROR] Failed to create epoll instance.\n";
+    close(listen_fd);
     return 1;
   }
 
+  ClientContext listen_ctx{listen_fd, ""};
   struct epoll_event ev {};
   ev.events = EPOLLIN | EPOLLET;
-  ev.data.fd = listen_fd;
+  ev.data.ptr = &listen_ctx;
 
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev) == -1) {
     std::cerr << "[ERROR] Failed to add listening socket to epoll.\n";
+    close(listen_fd);
+    close(epoll_fd);
     return 1;
   }
 
   struct epoll_event events[MAX_EVENTS];
 
   while (server_running) {
+    int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+    if (nfds == -1) {
+      if (errno == EINTR) {
+        continue;
+      }
+      std::cerr << "[ERROR] Failed to wait on epoll.\n";
+      server_running = false;
+    }
+
+    int client_fd;
+    ClientContext* ctx;
+
+    for (int i = 0; i < nfds; i++) {
+      ctx = static_cast<ClientContext*>(events[i].data.ptr);
+      if (ctx->client_fd == listen_fd) {
+        struct sockaddr_storage client_addr {};
+        socklen_t client_len = sizeof(client_addr);
+
+        while ((client_fd = accept(
+                    listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
+                    &client_len)) != -1) {
+          client_addr = {};
+          client_len = sizeof(client_addr);
+
+          if (set_nonblocking(client_fd) == false) {
+            std::cerr
+                << "[ERROR] Failed to set client socket to non-blocking.\n";
+            close(client_fd);
+            continue;
+          }
+
+          ctx = new ClientContext{client_fd, ""};
+          struct epoll_event client_ev {};
+          client_ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+          client_ev.data.ptr = ctx;
+          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
+            std::cerr << "[ERROR] Failed to add client socket to epoll.\n";
+            close(client_fd);
+            delete ctx;
+          }
+        }
+
+        if (client_fd == -1) {
+          if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            std::cerr << "[ERROR] accept() failed\n";
+          }
+        }
+      } else if (events[i].events & EPOLLERR || events[i].events & EPOLLHUP) {
+        std::cerr << "[ERROR] Epoll error on fd: " << ctx->client_fd << "\n";
+        close(ctx->client_fd);
+        delete ctx;
+      } else if (events[i].events & EPOLLIN) {
+        // HANDLE INCOMING CONNECTIONS HERE
+      }
+    }
   }
+
+  close(listen_fd);
+  close(epoll_fd);
 
   return 0;
 }

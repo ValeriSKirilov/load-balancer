@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -19,8 +20,10 @@
 #include <map>
 #include <mutex>
 #include <queue>
+#include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -56,6 +59,8 @@ static std::vector<int> wrr_schedule;
 static std::atomic<bool> server_running{true};
 
 static std::vector<std::thread> worker_threads;
+
+static std::atomic<long long> blocked_attacks{0};
 
 struct BackendServer {
   std::string ip;
@@ -173,6 +178,8 @@ class ThreadPool {
 struct ClientContext {
   int client_fd;
   std::string request_buffer;
+  std::string client_ip;
+  long long connected_at_ms;
 };
 
 struct HttpResponse {
@@ -427,6 +434,81 @@ bool set_blocking(int fd) {
   return true;
 }
 
+int hex_char_to_int(char c) {
+  if (c >= 0 && c <= 9) return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return 0;
+}
+
+std::string url_decode_once(std::string_view input) {
+  std::string result;
+  for (size_t i = 0; i < input.size(); ++i) {
+    if (input[i] == '+') {
+      result.push_back(' ');
+    } else if (input[i] == '%' && i + 2 < input.size() &&
+               std::isxdigit(static_cast<unsigned char>(input[i + 1])) &&
+               std::isxdigit(static_cast<unsigned char>(input[i + 2]))) {
+      int high, low;
+
+      high = hex_char_to_int(input[i + 1]);
+      low = hex_char_to_int(input[i + 2]);
+
+      result.push_back(static_cast<char>((high << 4) | low));
+      i += 2;
+    } else {
+      result.push_back(input[i]);
+    }
+  }
+
+  return result;
+}
+
+std::string normalize_payload(std::string_view raw_request) {
+  std::string current(raw_request);
+
+  for (int i = 0; i < 3; ++i) {
+    std::string next = url_decode_once(current);
+    if (next == current) {
+      break;
+    }
+    current = std::move(next);
+  }
+  return current;
+}
+
+bool inspect_request(const std::string& request) {
+  std::string normalized_request = normalize_payload(request);
+
+  static const std::regex master_sqli_rule(
+      R"((\b(?:OR|AND)\b\s+(['"]\w+['"]|\d+)\s*=\s*\2)|)"
+      R"((\bUNION\b\s+(?:\bALL\b\s+)?\bSELECT\b)|)"
+      R"((;\s*(?:DROP|EXEC|ALTER|TRUNCATE)\b)|)"
+      R"((\b(?:SLEEP|pg_sleep|WAITFOR\s+DELAY)\b)|)"
+      R"((['";]\s*(?:--|\#))|(\/\*[\s\S]*?\*\/)|)"
+      R"((<\s*script\b|javascript\s*:)|)"
+      R"((\.\.\/|\.\.\\|\/etc\/passwd))",
+      std::regex::icase | std::regex::optimize);
+
+  std::smatch match;
+
+  if (std::regex_search(normalized_request, match, master_sqli_rule)) {
+    std::cerr << "[BLOCKED] Full HTTP string: " << request << "\n";
+    std::cerr << "  -> Exact offending trigger (match[0]): " << match.str(0)
+              << "\n";
+    std::cerr << "  -> Trigger started at byte offset: " << match.position(0)
+              << "\n";
+
+    if (match[1].matched) {
+      std::cerr << "  -> Tautology value repeated (match[2]): " << match.str(2)
+                << "\n";
+    }
+    return true;
+  }
+
+  return false;
+}
+
 bool forward_to_backend(int client_fd, const std::string& request,
                         BackendServer& server) {
   int backend_fd = socket(server.addr.ss_family, SOCK_STREAM, 0);
@@ -531,6 +613,19 @@ void handle_client(
     return;
   }
 
+  if (inspect_request(ctx->request_buffer)) {
+    HttpResponse response_403 = {403, "Forbidden", {}, "Forbidden"};
+    std::string response_str = response_403.to_raw_string();
+    if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+        -1) {
+      std::cerr << "[ERROR] Failed to send 403 response to client.\n";
+    }
+    blocked_attacks.fetch_add(1, std::memory_order_relaxed);
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
   if (set_blocking(ctx->client_fd) == false) {
     std::cerr << "[ERROR] Failed to set client socket to blocking.\n";
     close(ctx->client_fd);
@@ -575,9 +670,9 @@ void handle_client(
   if (!forwarded_successfuly) {
     std::cerr << "[ERROR] Failed to forward request to backend server after "
                  "multiple attempts.\n";
-    HttpResponse response = {
+    HttpResponse response_503 = {
         503, "Service Unavailable", {}, "Service Unavailable"};
-    std::string response_str = response.to_raw_string();
+    std::string response_str = response_503.to_raw_string();
     if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
         -1) {
       std::cerr << "[ERROR] Failed to send 503 response to client.\n";
@@ -753,6 +848,17 @@ int main(const int argc, const char* argv[]) {
         while ((client_fd = accept(
                     listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr),
                     &client_len)) != -1) {
+          char client_ip[NI_MAXHOST];
+          if (getnameinfo(reinterpret_cast<struct sockaddr*>(&client_addr),
+                          client_len, client_ip, sizeof(client_ip), nullptr, 0,
+                          NI_NUMERICHOST) != 0) {
+            std::cerr << "[ERROR] Failed to get client IP.\n";
+            close(client_fd);
+            client_addr = {};
+            client_len = sizeof(client_addr);
+            continue;
+          }
+
           client_addr = {};
           client_len = sizeof(client_addr);
 
@@ -763,7 +869,8 @@ int main(const int argc, const char* argv[]) {
             continue;
           }
 
-          ClientContext* client_ctx = new ClientContext{client_fd, ""};
+          ClientContext* client_ctx =
+              new ClientContext{client_fd, "", client_ip, current_time_ms()};
           struct epoll_event client_ev {};
           client_ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
           client_ev.data.ptr = client_ctx;

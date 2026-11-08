@@ -175,6 +175,27 @@ struct ClientContext {
   std::string request_buffer;
 };
 
+struct HttpResponse {
+  int status_code;
+  std::string status_text;
+  std::map<std::string, std::string> headers;
+  std::string body;
+
+  std::string to_raw_string() const {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
+    for (const auto& [key, value] : headers) {
+      oss << key << ": " << value << "\r\n";
+    }
+
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "\r\n";
+
+    oss << body;
+    return oss.str();
+  }
+};
+
 std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
     algorithm_map = {
         {"ROUND_ROBIN",
@@ -391,6 +412,182 @@ bool set_nonblocking(int fd) {
   return true;
 }
 
+bool set_blocking(int fd) {
+  int flags = fcntl(fd, F_GETFL);
+  if (flags == -1) {
+    std::cerr << "[ERROR] Failed to get file descriptor flags.\n";
+    return false;
+  }
+
+  if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+    std::cerr << "[ERROR] Failed to set file descriptor to blocking.\n";
+    return false;
+  }
+
+  return true;
+}
+
+bool forward_to_backend(int client_fd, const std::string& request,
+                        BackendServer& server) {
+  int backend_fd = socket(server.addr.ss_family, SOCK_STREAM, 0);
+  if (backend_fd < 0) {
+    std::cerr << "[ERROR] Failed to create socket for backend server.\n";
+    return false;
+  }
+
+  timeval timeout{};
+  timeout.tv_sec = 2;
+  timeout.tv_usec = 0;
+  setsockopt(backend_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  setsockopt(backend_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  if (connect(backend_fd, reinterpret_cast<struct sockaddr*>(&server.addr),
+              server.addr_len) < 0) {
+    std::cerr << "[ERROR] Failed to connect to backend server: " << server.ip
+              << ":" << server.port << '\n';
+    server.is_healthy.store(false, std::memory_order_relaxed);
+    close(backend_fd);
+    return false;
+  }
+
+  if (send(backend_fd, request.c_str(), request.size(), 0) == -1) {
+    std::cerr << "[ERROR] Failed to send request to backend server.\n";
+    server.is_healthy.store(false, std::memory_order_relaxed);
+    close(backend_fd);
+    return false;
+  }
+
+  shutdown(backend_fd, SHUT_WR);
+
+  while (true) {
+    char buffer[4096];
+    ssize_t bytes_read = recv(backend_fd, buffer, sizeof(buffer), 0);
+    if (bytes_read == 0) {
+      break;
+    } else if (bytes_read < 0) {
+      std::cerr << "[ERROR] Failed to receive response from backend server.\n";
+      server.is_healthy.store(false, std::memory_order_relaxed);
+      close(backend_fd);
+      return false;
+    }
+
+    if (send(client_fd, buffer, bytes_read, 0) == -1) {
+      std::cerr << "[ERROR] Failed to send response to client.\n";
+      close(backend_fd);
+      break;
+    }
+  }
+
+  close(backend_fd);
+  return true;
+}
+
+void handle_client(
+    ClientContext* ctx, std::vector<BackendServer>& servers,
+    std::function<int(const std::vector<BackendServer>&)> selected_router_func,
+    int epoll_fd) {
+  char buffer[4096];
+  ssize_t bytes_read;
+
+  while (true) {
+    bytes_read = recv(ctx->client_fd, buffer, sizeof(buffer), 0);
+    if (bytes_read > 0) {
+      ctx->request_buffer.append(buffer, bytes_read);
+      continue;
+    }
+
+    if (bytes_read == 0) {
+      close(ctx->client_fd);
+      delete ctx;
+      return;
+    }
+
+    if (bytes_read == -1) {
+      if (errno == EINTR) {
+        continue;
+      } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        break;
+      } else {
+        std::cerr << "[ERROR] Failed to receive data from client.\n";
+        close(ctx->client_fd);
+        delete ctx;
+        return;
+      }
+    }
+  }
+
+  bool is_request_complete =
+      ctx->request_buffer.find("\r\n\r\n") != std::string::npos;
+
+  if (!is_request_complete) {
+    struct epoll_event ev {};
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    ev.data.ptr = ctx;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, ctx->client_fd, &ev) == -1) {
+      std::cerr << "[ERROR] Failed to modify client socket in epoll.\n";
+      close(ctx->client_fd);
+      delete ctx;
+    }
+    return;
+  }
+
+  if (set_blocking(ctx->client_fd) == false) {
+    std::cerr << "[ERROR] Failed to set client socket to blocking.\n";
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
+  bool forwarded_successfuly = false;
+  size_t max_retries = servers.size();
+
+  for (size_t attempts = 0; attempts < max_retries; ++attempts) {
+    int backend_idx = selected_router_func(servers);
+    if (backend_idx == -1) {
+      break;
+    }
+
+    servers[backend_idx].active_connections.fetch_add(
+        1, std::memory_order_relaxed);
+
+    long long start_time = current_time_ms();
+
+    bool ok = forward_to_backend(ctx->client_fd, ctx->request_buffer,
+                                 servers[backend_idx]);
+
+    long long end_time = current_time_ms();
+    servers[backend_idx].active_connections.fetch_sub(
+        1, std::memory_order_relaxed);
+
+    if (ok) {
+      long long new_avg_latency =
+          std::max(1LL, (servers[backend_idx].avg_latency_time.load(
+                             std::memory_order_relaxed) +
+                         (end_time - start_time)) /
+                            2);
+      servers[backend_idx].avg_latency_time.store(new_avg_latency,
+                                                  std::memory_order_relaxed);
+      forwarded_successfuly = true;
+      break;
+    }
+  }
+
+  if (!forwarded_successfuly) {
+    std::cerr << "[ERROR] Failed to forward request to backend server after "
+                 "multiple attempts.\n";
+    HttpResponse response = {
+        503, "Service Unavailable", {}, "Service Unavailable"};
+    std::string response_str = response.to_raw_string();
+    if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+        -1) {
+      std::cerr << "[ERROR] Failed to send 503 response to client.\n";
+    }
+  }
+
+  close(ctx->client_fd);
+  delete ctx;
+}
+
 int main(const int argc, const char* argv[]) {
   if (argc > 1 &&
       (argv[1] == std::string("-help") || argv[1] == std::string("-h"))) {
@@ -525,6 +722,15 @@ int main(const int argc, const char* argv[]) {
 
   struct epoll_event events[MAX_EVENTS];
 
+  std::thread health_thread([&servers] {
+    while (server_running) {
+      for (auto& server : servers) {
+        health_check(server);
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+  });
+
   while (server_running) {
     int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
     if (nfds == -1) {
@@ -557,14 +763,14 @@ int main(const int argc, const char* argv[]) {
             continue;
           }
 
-          ctx = new ClientContext{client_fd, ""};
+          ClientContext* client_ctx = new ClientContext{client_fd, ""};
           struct epoll_event client_ev {};
           client_ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-          client_ev.data.ptr = ctx;
+          client_ev.data.ptr = client_ctx;
           if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
             std::cerr << "[ERROR] Failed to add client socket to epoll.\n";
             close(client_fd);
-            delete ctx;
+            delete client_ctx;
           }
         }
 
@@ -578,11 +784,16 @@ int main(const int argc, const char* argv[]) {
         close(ctx->client_fd);
         delete ctx;
       } else if (events[i].events & EPOLLIN) {
-        // HANDLE INCOMING CONNECTIONS HERE
+        pool.enqueue([ctx, &servers, selected_router_func, epoll_fd] {
+          handle_client(ctx, servers, selected_router_func, epoll_fd);
+        });
       }
     }
   }
 
+  if (health_thread.joinable()) {
+    health_thread.join();
+  }
   close(listen_fd);
   close(epoll_fd);
 

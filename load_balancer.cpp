@@ -435,7 +435,7 @@ bool set_blocking(int fd) {
 }
 
 int hex_char_to_int(char c) {
-  if (c >= 0 && c <= 9) return c - '0';
+  if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
   if (c >= 'A' && c <= 'F') return c - 'A' + 10;
   return 0;
@@ -507,6 +507,34 @@ bool inspect_request(const std::string& request) {
   }
 
   return false;
+}
+
+std::string build_metrics_json(const std::vector<BackendServer>& servers) {
+  std::ostringstream oss;
+  oss << "{\n";
+  oss << "  \"blocked_attacks\": "
+      << blocked_attacks.load(std::memory_order_relaxed) << ",\n";
+  oss << "  \"backend_servers\": [\n";
+
+  for (size_t i = 0; i < servers.size(); ++i) {
+    oss << "    {" << "\"ip\": \"" << servers[i].ip << "\", "
+        << "\"port\": " << servers[i].port << ", " << "\"healthy\": "
+        << (servers[i].is_healthy.load(std::memory_order_relaxed) ? "true"
+                                                                  : "false")
+        << ", " << "\"active_connections\": "
+        << servers[i].active_connections.load(std::memory_order_relaxed) << ", "
+        << "\"avg_latency_ms\": "
+        << servers[i].avg_latency_time.load(std::memory_order_relaxed) << "}";
+
+    if (i + 1 < servers.size()) {
+      oss << ",";
+    }
+    oss << '\n';
+  }
+
+  oss << "  ]\n";
+  oss << "}\n";
+  return oss.str();
 }
 
 bool forward_to_backend(int client_fd, const std::string& request,
@@ -621,6 +649,25 @@ void handle_client(
       std::cerr << "[ERROR] Failed to send 403 response to client.\n";
     }
     blocked_attacks.fetch_add(1, std::memory_order_relaxed);
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
+  if (ctx->request_buffer.rfind("GET /lb-metrics", 0) == 0) {
+    std::string json_body = build_metrics_json(servers);
+
+    HttpResponse response_200 = {200,
+                                 "OK",
+                                 {{"Content-Type", "application/json"},
+                                  {"Access-Control-Allow-Origin", "*"}},
+                                 json_body};
+    std::string response_str = response_200.to_raw_string();
+
+    if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+        -1) {
+      std::cerr << "[ERROR] Failed to send metrics response to client.\n";
+    }
     close(ctx->client_fd);
     delete ctx;
     return;

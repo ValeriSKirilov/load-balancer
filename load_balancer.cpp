@@ -827,13 +827,12 @@ int main(const int argc, const char* argv[]) {
     return 1;
   }
 
-  std::string algorithm_str = "ROUND_ROBIN";  // Default algorithm
-  int num_threads = 4;                        // Default number of threads
-  std::string configFile = "backend.conf";    // Default config file
+  std::string algorithm_str = "ROUND_ROBIN";
+  int num_threads = 4;
+  std::string configFile = "backend.conf";
   const std::string logFile = "load-balancer.log";
 
-  auto selected_router_func =
-      algorithm_map[algorithm_str];  // Default to ROUND_ROBIN
+  auto selected_router_func = algorithm_map[algorithm_str];
 
   if (argc >= 2) {
     algorithm_str = argv[1];
@@ -940,7 +939,7 @@ int main(const int argc, const char* argv[]) {
     return 1;
   }
 
-  ClientContext listen_ctx{listen_fd, ""};
+  ClientContext listen_ctx{listen_fd, "", "", current_time_ms()};
   struct epoll_event ev {};
   ev.events = EPOLLIN | EPOLLET;
   ev.data.ptr = &listen_ctx;

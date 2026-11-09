@@ -35,7 +35,8 @@ const std::string usage =
     "  ROUND_ROBIN\n"
     "  WEIGHTED_RR\n"
     "  LEAST_CONN\n"
-    "  LEAST_TIME\n";
+    "  LEAST_TIME\n"
+    "  IP_HASH\n";
 
 const std::string INVALID_ALG_ERROR =
     "[ERROR] Invalid load balancing algorithm: \'%s\'.\n"
@@ -62,7 +63,7 @@ static std::vector<std::thread> worker_threads;
 
 static std::atomic<long long> blocked_attacks{0};
 
-struct BackendServer {
+struct alignas(64) BackendServer {
   std::string ip;
   int port;
   int weight;
@@ -203,10 +204,12 @@ struct HttpResponse {
   }
 };
 
-std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
+std::map<std::string, std::function<int(const std::vector<BackendServer>&,
+                                        const std::string&)>>
     algorithm_map = {
         {"ROUND_ROBIN",
-         [](const std::vector<BackendServer>& servers) {
+         [](const std::vector<BackendServer>& servers,
+            const std::string& client_ip) {
            size_t num_servers = servers.size();
            for (size_t i = 0; i < num_servers; ++i) {
              int idx =
@@ -218,7 +221,8 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
            return -1;
          }},
         {"WEIGHTED_RR",
-         [](const std::vector<BackendServer>& servers) {
+         [](const std::vector<BackendServer>& servers,
+            const std::string& client_ip) {
            if (wrr_schedule.empty()) return -1;
 
            for (size_t i = 0; i < wrr_schedule.size(); ++i) {
@@ -233,7 +237,8 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
            return -1;
          }},
         {"LEAST_CONN",
-         [](const std::vector<BackendServer>& servers) {
+         [](const std::vector<BackendServer>& servers,
+            const std::string& client_ip) {
            int min_connections = INT_MAX;
            int best_idx = -1;
            for (size_t i = 0; i < servers.size(); ++i) {
@@ -249,7 +254,9 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
            }
            return best_idx;
          }},
-        {"LEAST_TIME", [](const std::vector<BackendServer>& servers) {
+        {"LEAST_TIME",
+         [](const std::vector<BackendServer>& servers,
+            const std::string& client_ip) {
            int best_idx = -1;
            long long min_score = LLONG_MAX;
 
@@ -268,6 +275,21 @@ std::map<std::string, std::function<int(const std::vector<BackendServer>&)>>
              }
            }
            return best_idx;
+         }},
+        {"IP_HASH", [](const std::vector<BackendServer>& servers,
+                       const std::string& client_ip) {
+           size_t num_servers = servers.size();
+           if (num_servers == 0) return -1;
+
+           size_t hash_value = std::hash<std::string>{}(client_ip);
+
+           for (size_t i = 0; i < num_servers; ++i) {
+             int idx = (hash_value + i) % num_servers;
+             if (servers[idx].is_healthy.load(std::memory_order_relaxed)) {
+               return idx;
+             }
+           }
+           return -1;
          }}};
 
 std::vector<BackendServer> load_backend_servers(
@@ -594,7 +616,8 @@ bool forward_to_backend(int client_fd, const std::string& request,
 
 void handle_client(
     ClientContext* ctx, std::vector<BackendServer>& servers,
-    std::function<int(const std::vector<BackendServer>&)> selected_router_func,
+    std::function<int(const std::vector<BackendServer>&, const std::string&)>
+        selected_router_func,
     int epoll_fd) {
   char buffer[4096];
   ssize_t bytes_read;
@@ -641,6 +664,13 @@ void handle_client(
     return;
   }
 
+  if (set_blocking(ctx->client_fd) == false) {
+    std::cerr << "[ERROR] Failed to set client socket to blocking.\n";
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
   if (inspect_request(ctx->request_buffer)) {
     HttpResponse response_403 = {403, "Forbidden", {}, "Forbidden"};
     std::string response_str = response_403.to_raw_string();
@@ -673,18 +703,11 @@ void handle_client(
     return;
   }
 
-  if (set_blocking(ctx->client_fd) == false) {
-    std::cerr << "[ERROR] Failed to set client socket to blocking.\n";
-    close(ctx->client_fd);
-    delete ctx;
-    return;
-  }
-
   bool forwarded_successfuly = false;
   size_t max_retries = servers.size();
 
   for (size_t attempts = 0; attempts < max_retries; ++attempts) {
-    int backend_idx = selected_router_func(servers);
+    int backend_idx = selected_router_func(servers, ctx->client_ip);
     if (backend_idx == -1) {
       break;
     }
@@ -702,11 +725,11 @@ void handle_client(
         1, std::memory_order_relaxed);
 
     if (ok) {
+      long long old_latency =
+          servers[backend_idx].avg_latency_time.load(std::memory_order_relaxed);
+      long long sample_latency = end_time - start_time;
       long long new_avg_latency =
-          std::max(1LL, (servers[backend_idx].avg_latency_time.load(
-                             std::memory_order_relaxed) +
-                         (end_time - start_time)) /
-                            2);
+          std::max(1LL, (7 * old_latency + 3 * sample_latency) / 10);
       servers[backend_idx].avg_latency_time.store(new_avg_latency,
                                                   std::memory_order_relaxed);
       forwarded_successfuly = true;

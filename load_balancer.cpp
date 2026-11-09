@@ -559,6 +559,36 @@ std::string build_metrics_json(const std::vector<BackendServer>& servers) {
   return oss.str();
 }
 
+struct RateLimitEntry {
+  int request_count{0};
+  long long window_start_ms{0};
+};
+
+static std::unordered_map<std::string, RateLimitEntry> rate_limit_map;
+static std::mutex rate_limit_mutex;
+const int MAX_REQUESTS_PER_SEC = 50;
+
+bool is_rate_limited(const std::string& client_ip) {
+  long long now = current_time_ms();
+  std::lock_guard<std::mutex> lock(rate_limit_mutex);
+
+  auto& entry = rate_limit_map[client_ip];
+  if (now - entry.window_start_ms >= 1000) {
+    entry.window_start_ms = now;
+    entry.request_count = 1;
+    return false;
+  }
+
+  entry.request_count++;
+  if (entry.request_count > MAX_REQUESTS_PER_SEC) {
+    std::cerr << "[RATE LIMIT] IP " << client_ip << " exceeded limit ("
+              << entry.request_count << " req/s)\n";
+    return true;
+  }
+
+  return false;
+}
+
 bool forward_to_backend(int client_fd, const std::string& request,
                         BackendServer& server) {
   int backend_fd = socket(server.addr.ss_family, SOCK_STREAM, 0);
@@ -653,6 +683,26 @@ void handle_client(
       ctx->request_buffer.find("\r\n\r\n") != std::string::npos;
 
   if (!is_request_complete) {
+    if (current_time_ms() - ctx->connected_at_ms > 5000 ||
+        ctx->request_buffer.size() > 8192) {
+      std::cerr << "[SLOWLORIS BLOCKED] Client " << ctx->client_ip
+                << " exceeded request time or size limit.\n";
+      HttpResponse response_408 = {
+          408,
+          "Request Timeout",
+          {},
+          "408 Request Timeout - Slowloris Detected\n"};
+      std::string response_str = response_408.to_raw_string();
+      if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+          -1) {
+        std::cerr << "[ERROR] Failed to send 408 response to client.\n";
+      }
+      blocked_attacks.fetch_add(1, std::memory_order_relaxed);
+      close(ctx->client_fd);
+      delete ctx;
+      return;
+    }
+
     struct epoll_event ev {};
     ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
     ev.data.ptr = ctx;
@@ -666,6 +716,23 @@ void handle_client(
 
   if (set_blocking(ctx->client_fd) == false) {
     std::cerr << "[ERROR] Failed to set client socket to blocking.\n";
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
+  if (is_rate_limited(ctx->client_ip)) {
+    HttpResponse response_429 = {
+        429,
+        "Too Many Requests",
+        {},
+        "429 Too Many Requests - Rate Limit Exceeded\n"};
+    std::string response_str = response_429.to_raw_string();
+    if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+        -1) {
+      std::cerr << "[ERROR] Failed to send 429 response to client.\n";
+    }
+    blocked_attacks.fetch_add(1, std::memory_order_relaxed);
     close(ctx->client_fd);
     delete ctx;
     return;

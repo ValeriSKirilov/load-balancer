@@ -1,0 +1,37 @@
+services:
+  backend1:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./backends:/app
+    command: python3 -u server.py 9001
+    ports:
+      - "9001:9001"
+
+  backend2:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./backends:/app
+    command: python3 -u server.py 9002
+    ports:
+      - "9002:9002"
+
+  backend3:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./backends:/app
+    command: python3 -u server.py 9003
+    ports:
+      - "9003:9003"
+
+  load_balancer:
+    build: .
+    command: sh -c "sleep 1 && ./build/load_balancer ${ALGO:-ROUND_ROBIN} ${THREADS:-4} ${CONF:-backend.docker.conf}"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend1
+      - backend2
+      - backend3

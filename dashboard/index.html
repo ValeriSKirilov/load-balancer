@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>L7 Load Balancer & WAF</title>
+    <!-- Empty icon: stops the browser from requesting /favicon.ico -->
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        --bg: #faf6f0;
+        --card: #f3ece1;
+        --border: #e2d7c5;
+        --text: #2c2520;
+        --muted: #7c6f64;
+        --sage: #4a7c59;
+        --terracotta: #c85a32;
+        --amber: #d48c46;
+        --espresso: #3a302a;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 36px 20px;
+        line-height: 1.5;
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 14px;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 18px;
+        margin-bottom: 24px;
+      }
+
+      h1 {
+        font-size: 1.45rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+
+      .subtitle {
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+
+      .pills {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .pill {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        padding: 8px 16px;
+        border-radius: 999px;
+        font-size: 0.88rem;
+        font-weight: 600;
+      }
+
+      .pill .accent {
+        color: var(--terracotta);
+        font-weight: 700;
+      }
+
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+
+      .pill.online .dot {
+        background: var(--sage);
+      }
+
+      .pill.offline .dot {
+        background: var(--terracotta);
+      }
+
+      .controls {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin-bottom: 28px;
+      }
+
+      select,
+      button {
+        font-family: inherit;
+        font-size: 0.88rem;
+        font-weight: 600;
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      select {
+        background-color: var(--card);
+        color: var(--text);
+        outline: none;
+      }
+
+      button {
+        background-color: var(--espresso);
+        color: var(--bg);
+        border-color: var(--espresso);
+      }
+
+      button:hover:not(:disabled) {
+        opacity: 0.9;
+        transform: translateY(-1px);
+      }
+
+      button:active:not(:disabled) {
+        transform: translateY(0);
+      }
+
+      button:disabled,
+      select:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      button.btn-heavy {
+        background-color: var(--amber);
+        border-color: var(--amber);
+        color: #fff;
+      }
+
+      button.btn-attack {
+        background-color: var(--terracotta);
+        border-color: var(--terracotta);
+        color: #fff;
+      }
+
+      button.btn-ghost {
+        background: transparent;
+        color: var(--muted);
+        border-color: var(--border);
+        padding: 5px 12px;
+        font-size: 0.78rem;
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+
+      .section-title {
+        font-size: 0.78rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+
+      .servers-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+
+      .server-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 18px;
+      }
+
+      .server-card.is-down {
+        opacity: 0.75;
+      }
+
+      .server-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+
+      .server-title {
+        font-weight: 700;
+        font-size: 0.95rem;
+        overflow-wrap: anywhere;
+      }
+
+      .badge {
+        font-size: 0.72rem;
+        font-weight: 700;
+        padding: 3px 10px;
+        border-radius: 999px;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .badge.healthy {
+        background: rgba(74, 124, 89, 0.15);
+        color: var(--sage);
+      }
+
+      .badge.down {
+        background: rgba(200, 90, 50, 0.15);
+        color: var(--terracotta);
+      }
+
+      .stat-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.85rem;
+        color: var(--muted);
+        margin-top: 6px;
+      }
+
+      .stat-row strong {
+        color: var(--text);
+      }
+
+      .bar-bg {
+        height: 6px;
+        background: var(--border);
+        border-radius: 999px;
+        overflow: hidden;
+        margin-top: 8px;
+      }
+
+      .bar-fill {
+        height: 100%;
+        background: var(--sage);
+        transition: width 0.3s ease;
+      }
+
+      .bar-fill.share {
+        background: var(--amber);
+      }
+
+      .empty {
+        grid-column: 1 / -1;
+        color: var(--muted);
+        font-size: 0.9rem;
+        padding: 12px 0;
+      }
+
+      .log-box {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 14px 18px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.82rem;
+        color: var(--muted);
+        height: 220px;
+        overflow-y: auto;
+      }
+
+      .log-entry {
+        margin-bottom: 4px;
+        overflow-wrap: anywhere;
+      }
+
+      .log-entry.ok {
+        color: var(--sage);
+      }
+
+      .log-entry.warn {
+        color: var(--amber);
+      }
+
+      .log-entry.err {
+        color: var(--terracotta);
+      }
+
+      .hint {
+        font-size: 0.78rem;
+        color: var(--muted);
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>C++ L7 Load Balancer & WAF</h1>
+        <div class="subtitle">Live telemetry &amp; traffic control</div>
+      </div>
+      <div class="pills">
+        <div id="conn-pill" class="pill">
+          <i class="dot"></i><span id="conn-text">Connecting...</span>
+        </div>
+        <div class="pill">
+          Blocked attacks: <span id="blocked-count" class="accent">0</span>
+        </div>
+      </div>
+    </header>
+
+    <section class="controls">
+      <select id="algo-select" aria-label="Routing algorithm">
+        <option value="ROUND_ROBIN">Algorithm: ROUND_ROBIN</option>
+        <option value="WEIGHTED_RR">Algorithm: WEIGHTED_RR</option>
+        <option value="LEAST_CONN">Algorithm: LEAST_CONN</option>
+        <option value="LEAST_TIME">Algorithm: LEAST_TIME</option>
+        <option value="IP_HASH">Algorithm: IP_HASH</option>
+      </select>
+      <button id="btn-fast" class="action">1. Send 6 fast (/fast)</button>
+      <button id="btn-mix" class="action btn-heavy">2. Heavy + fast mix</button>
+      <button id="btn-rate" class="action btn-heavy">
+        3. Rate-limit burst (60)
+      </button>
+      <select
+        id="attack-select"
+        class="action"
+        aria-label="Attack payload"
+      ></select>
+      <button id="btn-attack" class="action btn-attack">
+        4. Launch attack
+      </button>
+    </section>
+
+    <div class="section-head">
+      <span class="section-title">Backends</span>
+      <button
+        id="btn-reset"
+        class="btn-ghost"
+        title="Reset the per-backend response counters"
+      >
+        Reset tally
+      </button>
+    </div>
+    <section id="servers-container" class="servers-grid"></section>
+
+    <div class="section-head">
+      <span class="section-title">Log (green = behaved as expected)</span>
+    </div>
+    <section id="log" class="log-box" aria-live="polite"></section>
+    <p class="hint">
+      "Responses seen here" counts only requests sent from this page, grouped by
+      the backend port that answered. It resets when you switch algorithm.
+    </p>
+
+    <script>
+      "use strict";
+
+      // Same origin when served by the load balancer at /dashboard.
+      const LB_URL = window.location.protocol.startsWith("http")
+        ? window.location.origin
+        : "http://127.0.0.1:8080";
+      const REQUEST_TIMEOUT_MS = 5000;
+      const POLL_INTERVAL_MS = 500;
+      const POLL_INTERVAL_HIDDEN_MS = 3000;
+      const MAX_LOG_ENTRIES = 200;
+      const RATE_LIMIT_BURST = 60;
+
+      // Pre-encoded on purpose: this is exactly what goes on the wire.
+      const ATTACKS = [
+        { name: "SQLi tautology", path: "/?id=1'%20OR%20'1'='1" },
+        {
+          name: "UNION SELECT",
+          path: "/?q=1%20UNION%20SELECT%20username,password%20FROM%20users",
+        },
+        { name: "DROP TABLE", path: "/?q=1;%20DROP%20TABLE%20users" },
+        { name: "XSS <script>", path: "/?q=%3Cscript%3Ealert(1)%3C/script%3E" },
+        { name: "Path traversal", path: "/?file=../../etc/passwd" },
+        {
+          name: "Double-encoded SQLi",
+          path: "/?id=1%2527%2520OR%2520%25271%2527%253D%25271",
+        },
+      ];
+
+      const $ = (id) => document.getElementById(id);
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const algoSelect = $("algo-select");
+      const attackSelect = $("attack-select");
+
+      let activeAlgo = null;
+      let lastMetrics = null;
+      let online = null;
+      let busy = false;
+      const tally = new Map(); // backend port (string) -> responses seen
+      let tallyTotal = 0;
+
+      for (const attack of ATTACKS) {
+        attackSelect.append(new Option(`Attack: ${attack.name}`, attack.path));
+      }
+
+      // ---------- small helpers ----------
+
+      function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function addLog(message, type = "") {
+        const log = $("log");
+        const time = new Date().toLocaleTimeString();
+        log.prepend(
+          el("div", `log-entry ${type}`.trim(), `[${time}] ${message}`),
+        );
+        while (log.childElementCount > MAX_LOG_ENTRIES) {
+          log.lastElementChild.remove();
+        }
+      }
+
+      function summarize(labels) {
+        const counts = new Map();
+        for (const label of labels) {
+          counts.set(label, (counts.get(label) || 0) + 1);
+        }
+        return [...counts].map(([k, v]) => `${k} x${v}`).join(", ");
+      }
+
+      const portLabel = (r) =>
+        r.port ? `:${r.port}` : r.status ? `HTTP ${r.status}` : "failed";
+
+      function statusClass(status) {
+        if (status >= 200 && status < 300) return "ok";
+        if (status >= 400 && status < 500) return "warn";
+        return "err";
+      }
+
+      function resetTally() {
+        tally.clear();
+        tallyTotal = 0;
+        if (lastMetrics) renderServers(lastMetrics.servers);
+      }
+
+      function recordHit(port) {
+        tally.set(port, (tally.get(port) || 0) + 1);
+        tallyTotal += 1;
+      }
+
+      // ---------- networking ----------
+
+      function backendPort(res, text) {
+        const header = res.headers.get("X-Backend-Port");
+        if (header && /^\d+$/.test(header)) return header;
+        const match = /Backend on port (\d+)/.exec(text);
+        return match ? match[1] : null;
+      }
+
+      async function request(path) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          const res = await fetch(LB_URL + path, {
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          const text = await res.text();
+          return {
+            status: res.status,
+            ok: res.ok,
+            text,
+            port: backendPort(res, text),
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      // Never throws: network failures come back as status 0.
+      async function sendOne(path, label, { silent = false } = {}) {
+        let result;
+        try {
+          result = await request(path);
+        } catch (err) {
+          const reason =
+            err.name === "AbortError" ? "timed out" : "connection failed";
+          if (!silent) addLog(`${label} -> ${reason}`, "err");
+          return { status: 0, ok: false, port: null };
+        }
+        if (result.ok && result.port) recordHit(result.port);
+        if (!silent) {
+          const preview = result.text.trim().split("\n")[0].slice(0, 100);
+          addLog(
+            `${label} -> [${result.status}] ${preview}`,
+            statusClass(result.status),
+          );
+        }
+        return result;
+      }
+
+      // ---------- metrics polling ----------
+
+      function parseMetrics(data) {
+        if (
+          !data ||
+          typeof data !== "object" ||
+          !Array.isArray(data.backend_servers)
+        ) {
+          throw new Error("unexpected /lb-metrics format");
+        }
+        return {
+          blocked: Number(data.blocked_attacks) || 0,
+          algo:
+            typeof data.active_algorithm === "string"
+              ? data.active_algorithm
+              : null,
+          servers: data.backend_servers.map((s) => ({
+            ip: String(s.ip ?? "?"),
+            port: Number(s.port) || 0,
+            healthy: s.healthy === true,
+            active: Number(s.active_connections) || 0,
+            latency: Number(s.avg_latency_ms) || 0,
+          })),
+        };
+      }
+
+      function statRow(label, value) {
+        const row = el("div", "stat-row");
+        row.append(el("span", "", label), el("strong", "", value));
+        return row;
+      }
+
+      function bar(percent, extraClass) {
+        const bg = el("div", "bar-bg");
+        const fill = el("div", `bar-fill ${extraClass}`.trim());
+        fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+        bg.append(fill);
+        return bg;
+      }
+
+      function renderServers(servers) {
+        const container = $("servers-container");
+        if (servers.length === 0) {
+          container.replaceChildren(
+            el(
+              "div",
+              "empty",
+              "The load balancer reported no backend servers.",
+            ),
+          );
+          return;
+        }
+
+        const maxLatency = Math.max(50, ...servers.map((s) => s.latency));
+        container.replaceChildren(
+          ...servers.map((s, idx) => {
+            const hits = tally.get(String(s.port)) || 0;
+            const share = tallyTotal > 0 ? (hits / tallyTotal) * 100 : 0;
+
+            const card = el("div", `server-card${s.healthy ? "" : " is-down"}`);
+            const head = el("div", "server-header");
+            head.append(
+              el(
+                "span",
+                "server-title",
+                `Backend #${idx + 1} (${s.ip}:${s.port})`,
+              ),
+              el(
+                "span",
+                `badge ${s.healthy ? "healthy" : "down"}`,
+                s.healthy ? "Healthy" : "Offline",
+              ),
+            );
+            card.append(
+              head,
+              statRow("Active connections", String(s.active)),
+              statRow("EWMA latency", `${s.latency} ms`),
+              bar(Math.max(4, (s.latency / maxLatency) * 100), ""),
+              statRow("Responses seen here", `${hits} (${Math.round(share)}%)`),
+              bar(share, "share"),
+            );
+            return card;
+          }),
+        );
+      }
+
+      function syncAlgorithm(name) {
+        if (!name) return;
+        activeAlgo = name;
+        const known = [...algoSelect.options].some((o) => o.value === name);
+        if (
+          known &&
+          !algoSelect.disabled &&
+          document.activeElement !== algoSelect
+        ) {
+          algoSelect.value = name;
+        }
+      }
+
+      function setConnection(isOnline, reason = "") {
+        $("conn-pill").className = `pill ${isOnline ? "online" : "offline"}`;
+        $("conn-text").textContent = isOnline
+          ? "Connected"
+          : "Load balancer unreachable";
+        if (online !== isOnline) {
+          if (isOnline) {
+            addLog("Connected to the load balancer.", "ok");
+          } else {
+            addLog(`Lost connection to the load balancer (${reason}).`, "err");
+          }
+          online = isOnline;
+        }
+      }
+
+      async function pollMetrics() {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        try {
+          const res = await fetch(`${LB_URL}/lb-metrics`, {
+            signal: controller.signal,
+            cache: "no-store",
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const metrics = parseMetrics(await res.json());
+          lastMetrics = metrics;
+          $("blocked-count").textContent = String(metrics.blocked);
+          syncAlgorithm(metrics.algo);
+          renderServers(metrics.servers);
+          return metrics;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function pollLoop() {
+        try {
+          await pollMetrics();
+          setConnection(true);
+        } catch (err) {
+          setConnection(
+            false,
+            err.name === "AbortError" ? "timed out" : err.message,
+          );
+        }
+        setTimeout(
+          pollLoop,
+          document.hidden ? POLL_INTERVAL_HIDDEN_MS : POLL_INTERVAL_MS,
+        );
+      }
+
+      // ---------- actions ----------
+
+      function setActionsDisabled(disabled) {
+        for (const node of document.querySelectorAll(".action")) {
+          node.disabled = disabled;
+        }
+        algoSelect.disabled = disabled;
+      }
+
+      // One test at a time, so results never interleave.
+      async function runExclusive(fn) {
+        if (busy) return;
+        busy = true;
+        setActionsDisabled(true);
+        try {
+          await fn();
+        } catch (err) {
+          addLog(`Unexpected error: ${err.message}`, "err");
+        } finally {
+          busy = false;
+          setActionsDisabled(false);
+        }
+      }
+
+      async function switchAlgorithm(algo) {
+        const previous = activeAlgo;
+        addLog(`Switching algorithm to ${algo}...`);
+        let res;
+        try {
+          res = await request(`/lb-config?algo=${encodeURIComponent(algo)}`);
+        } catch (err) {
+          addLog("Could not reach /lb-config.", "err");
+          if (previous) algoSelect.value = previous;
+          return;
+        }
+
+        let body = null;
+        try {
+          body = JSON.parse(res.text);
+        } catch (err) {
+          /* handled below */
+        }
+
+        if (res.ok && body && body.status === "ok") {
+          activeAlgo = body.active_algorithm || algo;
+          algoSelect.value = activeAlgo;
+          resetTally();
+          addLog(`Active algorithm is now ${activeAlgo} (tally reset).`, "ok");
+        } else {
+          const detail = body && body.error ? `: ${body.error}` : "";
+          addLog(`Switch rejected (HTTP ${res.status}${detail}).`, "err");
+          if (previous) algoSelect.value = previous;
+        }
+      }
+
+      async function sendFastBurst() {
+        addLog("Sending 6 sequential /fast requests...");
+        const results = [];
+        for (let i = 1; i <= 6; i++) {
+          results.push(await sendOne("/fast", `#${i}`));
+        }
+        addLog(`Distribution: ${summarize(results.map(portLabel))}`);
+      }
+
+      async function sendMix() {
+        addLog("Firing 1 slow /heavy (200 ms) + 3 /fast concurrently...");
+        const heavy = sendOne("/heavy", "HEAVY");
+        await sleep(25);
+        const fast = [1, 2, 3].map((i) => sendOne("/fast", `FAST #${i}`));
+        const [h, ...f] = await Promise.all([heavy, ...fast]);
+
+        const shared = f.filter((r) => r.port && r.port === h.port).length;
+        addLog(
+          `Heavy -> ${portLabel(h)}; fast -> ${f.map(portLabel).join(", ")}. ` +
+            `${shared} of 3 fast requests shared the heavy request's backend ` +
+            `(LEAST_CONN / LEAST_TIME should usually avoid it).`,
+        );
+      }
+
+      async function sendRateBurst() {
+        addLog(
+          `Firing ${RATE_LIMIT_BURST} /fast requests at once (limit: 50 req/s per IP)...`,
+        );
+        const results = await Promise.all(
+          Array.from({ length: RATE_LIMIT_BURST }, () =>
+            sendOne("/fast", "burst", { silent: true }),
+          ),
+        );
+        const limited = results.filter((r) => r.status === 429).length;
+        addLog(
+          `Results: ${summarize(results.map((r) => r.status || "failed"))}`,
+          limited > 0 ? "ok" : "warn",
+        );
+        if (limited === 0) {
+          addLog(
+            "No 429 seen. The burst may have been spread over two 1-second windows, try again.",
+            "warn",
+          );
+        }
+      }
+
+      async function launchAttack() {
+        const path = attackSelect.value;
+        const name = ATTACKS[attackSelect.selectedIndex].name;
+        const before = lastMetrics ? lastMetrics.blocked : null;
+        addLog(`Launching ${name}: GET ${path}`);
+
+        const res = await sendOne(path, "attack", { silent: true });
+        if (res.status === 403) {
+          addLog("WAF blocked it (HTTP 403 Forbidden).", "ok");
+        } else if (res.status === 0) {
+          addLog("Connection dropped or timed out (no HTTP response).", "err");
+        } else {
+          addLog(
+            `NOT blocked: the WAF let it through (HTTP ${res.status}).`,
+            "err",
+          );
+        }
+
+        try {
+          const after = (await pollMetrics()).blocked;
+          if (before !== null && res.status === 403) {
+            const expected = after === before + 1;
+            addLog(
+              `Blocked counter: ${before} -> ${after}`,
+              expected ? "ok" : "warn",
+            );
+          }
+        } catch (err) {
+          addLog("Could not re-read /lb-metrics.", "warn");
+        }
+      }
+
+      // ---------- wiring ----------
+
+      algoSelect.addEventListener("change", () =>
+        runExclusive(() => switchAlgorithm(algoSelect.value)),
+      );
+      $("btn-fast").addEventListener("click", () =>
+        runExclusive(sendFastBurst),
+      );
+      $("btn-mix").addEventListener("click", () => runExclusive(sendMix));
+      $("btn-rate").addEventListener("click", () =>
+        runExclusive(sendRateBurst),
+      );
+      $("btn-attack").addEventListener("click", () =>
+        runExclusive(launchAttack),
+      );
+      $("btn-reset").addEventListener("click", () => {
+        resetTally();
+        addLog("Tally reset.");
+      });
+
+      addLog(`Dashboard ready. Polling ${LB_URL}/lb-metrics`);
+      pollLoop();
+    </script>
+  </body>
+</html>

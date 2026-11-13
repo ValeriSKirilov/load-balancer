@@ -9,6 +9,7 @@ WORKDIR /app
 COPY CMakeLists.txt backend.conf backend.docker.conf ./
 COPY include ./include
 COPY src ./src
+COPY dashboard ./dashboard
 
 RUN cmake -B build && cmake --build build
 

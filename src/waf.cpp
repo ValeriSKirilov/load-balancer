@@ -13,7 +13,46 @@ int hex_char_to_int(char c) {
   return 0;
 }
 
+bool starts_with_icase(std::string_view text, std::string_view prefix) {
+  if (text.size() < prefix.size()) return false;
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(text[i])) !=
+        std::tolower(static_cast<unsigned char>(prefix[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string strip_accept_headers(const std::string& request) {
+  std::string result;
+  result.reserve(request.size());
+
+  size_t pos = 0;
+  bool is_request_line = true;
+
+  while (pos < request.size()) {
+    size_t eol = request.find("\r\n", pos);
+    size_t next = (eol == std::string::npos) ? request.size() : eol + 2;
+    std::string_view line(request.data() + pos, next - pos);
+
+    if (line == "\r\n") {
+      result.append(request, pos, std::string::npos);
+      break;
+    }
+
+    if (is_request_line || !starts_with_icase(line, "accept")) {
+      result.append(line);
+    }
+    is_request_line = false;
+    pos = next;
+  }
+
+  return result;
+}
 }  // namespace
+
+// TODO
 
 std::string url_decode_once(std::string_view input) {
   std::string result;
@@ -50,7 +89,8 @@ std::string normalize_payload(std::string_view raw_request) {
 }
 
 bool inspect_request(const std::string& request) {
-  std::string normalized_request = normalize_payload(request);
+  std::string normalized_request =
+      normalize_payload(strip_accept_headers(request));
 
   static const std::regex master_sqli_rule(
       R"((\b(?:OR|AND)\b\s+['"]?(\w+)['"]?\s*=\s*['"]?\2\b)|)"

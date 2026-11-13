@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 
 #include "lb/algorithms.hpp"
 #include "lb/http_response.hpp"
@@ -130,6 +132,33 @@ void handle_client(ClientContext* ctx, std::vector<BackendServer>& servers,
     return;
   }
 
+  if (ctx->request_buffer.rfind("GET /dashboard", 0) == 0) {
+    std::ifstream file("dashboard/index.html");
+    if (!file.is_open()) {
+      std::cerr << "[ERROR] Failed to open dashboard/index.html\n";
+      HttpResponse response_500 = {
+          500, "Internal Server Error", {}, "Internal Server Error"};
+      std::string response_str = response_500.to_raw_string();
+      if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
+          -1) {
+        std::cerr << "[ERROR] Failed to send 500 response to client.\n";
+      }
+      close(ctx->client_fd);
+      delete ctx;
+      return;
+    }
+
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    HttpResponse res = {
+        200, "OK", {{"Content-Type", "text/html; charset=utf-8"}}, ss.str()};
+    std::string s = res.to_raw_string();
+    send(ctx->client_fd, s.c_str(), s.size(), 0);
+    close(ctx->client_fd);
+    delete ctx;
+    return;
+  }
+
   if (ctx->request_buffer.rfind("GET /lb-metrics", 0) == 0) {
     std::string json_body = build_metrics_json(servers);
 
@@ -153,7 +182,7 @@ void handle_client(ClientContext* ctx, std::vector<BackendServer>& servers,
     HttpResponse response_429 = {
         429,
         "Too Many Requests",
-        {},
+        {{"Access-Control-Allow-Origin", "*"}},
         "429 Too Many Requests - Rate Limit Exceeded\n"};
     std::string response_str = response_429.to_raw_string();
     if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
@@ -167,7 +196,8 @@ void handle_client(ClientContext* ctx, std::vector<BackendServer>& servers,
   }
 
   if (inspect_request(ctx->request_buffer)) {
-    HttpResponse response_403 = {403, "Forbidden", {}, "Forbidden"};
+    HttpResponse response_403 = {
+        403, "Forbidden", {{"Access-Control-Allow-Origin", "*"}}, "Forbidden"};
     std::string response_str = response_403.to_raw_string();
     if (send(ctx->client_fd, response_str.c_str(), response_str.size(), 0) ==
         -1) {
